@@ -30,30 +30,6 @@ export async function onRequest({ request, env }) {
         });
     }
 
-    // 4. 白名单（按需增删）
-    const ALLOWED_HOSTS = [
-        'github.com',
-        'www.github.com',
-        'raw.githubusercontent.com',
-        'gist.github.com',
-        'generativelanguage.googleapis.com',
-        'api.openai.com',
-        'huggingface.co'
-    ];
-
-    const isAllowed = ALLOWED_HOSTS.some(allowed =>
-        targetHost === allowed || targetHost.endsWith('.' + allowed)
-    );
-
-    if (!isAllowed) {
-        return new Response(JSON.stringify({
-            error: `域名 ${targetHost} 不在白名单中`
-        }), {
-            status: 403,
-            headers: { 'Content-Type': 'application/json' }
-        });
-    }
-
     // 5. 构造转发请求（保留原请求的 method、headers、body）
     const newRequest = new Request(targetUrl, {
         method: request.method,
