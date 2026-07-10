@@ -31,21 +31,26 @@ export async function onRequest({ request, env }) {
         });
     }
 
-    // 4. 🌟 动态白名单（允许代理任意 HTTPS 外部资源）
-    // 改为宽松模式：只要是 HTTPS 且非内网 IP 就允许
-    const isAllowed = (host) => {
-        // 禁止内网地址
-        const internalIPs = ['127.0.0.1', 'localhost', '::1', '10.', '172.16.', '192.168.'];
-        for (const ip of internalIPs) {
-            if (host.startsWith(ip)) return false;
+    // 4. 🚀 去掉白名单，只禁止内网地址（安全防护）
+    const isBlocked = (host) => {
+        // 禁止内网地址，防止 SSRF 攻击
+        const blockedPatterns = [
+            '127.0.0.1', 'localhost', '::1',
+            '10.', '172.16.', '172.17.', '172.18.', '172.19.',
+            '172.20.', '172.21.', '172.22.', '172.23.',
+            '172.24.', '172.25.', '172.26.', '172.27.',
+            '172.28.', '172.29.', '172.30.', '172.31.',
+            '192.168.', '169.254.'
+        ];
+        for (const pattern of blockedPatterns) {
+            if (host.startsWith(pattern)) return true;
         }
-        // 允许所有公网 HTTPS
-        return true;
+        return false;
     };
 
-    if (!isAllowed(targetHost)) {
+    if (isBlocked(targetHost)) {
         return new Response(JSON.stringify({
-            error: `域名 ${targetHost} 不允许代理（内网地址）`
+            error: `禁止访问内网地址: ${targetHost}`
         }), {
             status: 403,
             headers: { 'Content-Type': 'application/json' }
@@ -76,11 +81,10 @@ export async function onRequest({ request, env }) {
         // 读取响应体
         let responseBody = await response.text();
 
-        // 6. 🔧 HTML 内容重写（修复双斜杠 + 外部资源代理）
+        // 6. HTML 内容重写
         if (isHtml) {
             const baseProxyUrl = `${targetProtocol}//${url.host}${url.pathname}`;
 
-            // 🔧 修复：正确拼接 URL，避免双斜杠
             const proxyUrl = (href) => {
                 if (!href) return href;
                 // 跳过特殊协议
@@ -88,19 +92,17 @@ export async function onRequest({ request, env }) {
                 // 如果已经是代理链接，跳过
                 if (href.startsWith(baseProxyUrl)) return href;
 
-                // 处理完整 URL（外部资源）
+                // 完整 URL（外部资源）
                 if (href.startsWith('http://') || href.startsWith('https://')) {
-                    // 🔧 关键修复：直接代理外部资源，不拼接 targetHost
                     return `${baseProxyUrl}?url=${href}`;
                 }
 
-                // 处理绝对路径（以 / 开头）
+                // 绝对路径
                 if (href.startsWith('/')) {
-                    // 🔧 修复：去掉多余的 /，直接拼接
                     return `${baseProxyUrl}?url=${targetHost}${href}`;
                 }
 
-                // 处理相对路径（不以 / 开头）
+                // 相对路径
                 if (!href.startsWith('/') && !href.startsWith('http')) {
                     return `${baseProxyUrl}?url=${targetHost}/${href}`;
                 }
@@ -108,7 +110,7 @@ export async function onRequest({ request, env }) {
                 return href;
             };
 
-            // 重写所有资源链接
+            // 重写标签
             const rewriteTag = (html, tag, attr) => {
                 const regex = new RegExp(`<${tag}\\s+([^>]*?)${attr}=["']([^"']*)["']`, 'gi');
                 return html.replace(regex, (match, attrs, value) => {
@@ -123,7 +125,7 @@ export async function onRequest({ request, env }) {
             responseBody = rewriteTag(responseBody, 'img', 'src');
             responseBody = rewriteTag(responseBody, 'form', 'action');
 
-            // 重写 CSS url()
+            // CSS url()
             responseBody = responseBody.replace(
                 /url\(["']?([^"')]*)["']?\)/gi,
                 (match, cssUrl) => {
@@ -132,7 +134,7 @@ export async function onRequest({ request, env }) {
                 }
             );
 
-            // 重写 meta
+            // meta
             responseBody = responseBody.replace(
                 /<meta\s+([^>]*?)content=["']([^"']*)["']/gi,
                 (match, attrs, content) => {
@@ -144,7 +146,7 @@ export async function onRequest({ request, env }) {
             );
         }
 
-        // 7. CSS 内容重写（处理 CSS 中的 url()）
+        // 7. CSS 内容重写
         if (isCss) {
             const baseProxyUrl = `${targetProtocol}//${url.host}${url.pathname}`;
             const proxyUrl = (href) => {
@@ -184,7 +186,7 @@ export async function onRequest({ request, env }) {
             }
         }
 
-        // 添加 CORS 头
+        // CORS 头
         newResponse.headers.set('Access-Control-Allow-Origin', '*');
         newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         newResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
