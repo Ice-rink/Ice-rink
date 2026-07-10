@@ -31,6 +31,27 @@ export async function onRequest({ request, env }) {
         });
     }
 
+    // 4. 🌟 动态白名单（允许代理任意 HTTPS 外部资源）
+    // 改为宽松模式：只要是 HTTPS 且非内网 IP 就允许
+    const isAllowed = (host) => {
+        // 禁止内网地址
+        const internalIPs = ['127.0.0.1', 'localhost', '::1', '10.', '172.16.', '192.168.'];
+        for (const ip of internalIPs) {
+            if (host.startsWith(ip)) return false;
+        }
+        // 允许所有公网 HTTPS
+        return true;
+    };
+
+    if (!isAllowed(targetHost)) {
+        return new Response(JSON.stringify({
+            error: `域名 ${targetHost} 不允许代理（内网地址）`
+        }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+
     // 5. 转发请求
     const newRequest = new Request(targetUrl, {
         method: request.method,
@@ -49,80 +70,60 @@ export async function onRequest({ request, env }) {
         const response = await fetch(newRequest);
         const contentType = response.headers.get('Content-Type') || '';
         const isHtml = contentType.includes('text/html');
+        const isCss = contentType.includes('text/css');
+        const isJs = contentType.includes('javascript') || contentType.includes('ecmascript');
 
         // 读取响应体
         let responseBody = await response.text();
 
-        // 6. 🔧 HTML 内容重写（仅对 HTML 生效）
+        // 6. 🔧 HTML 内容重写（修复双斜杠 + 外部资源代理）
         if (isHtml) {
-            // 获取当前代理的基础 URL
             const baseProxyUrl = `${targetProtocol}//${url.host}${url.pathname}`;
 
-            // 构建代理链接的函数
+            // 🔧 修复：正确拼接 URL，避免双斜杠
             const proxyUrl = (href) => {
                 if (!href) return href;
-                // 跳过 javascript:、mailto:、tel:、#、data: 等协议
+                // 跳过特殊协议
                 if (/^(javascript|mailto|tel|data|blob|ws|wss):/.test(href)) return href;
                 // 如果已经是代理链接，跳过
                 if (href.startsWith(baseProxyUrl)) return href;
-                // 如果是绝对路径（以 / 开头）
+
+                // 处理完整 URL（外部资源）
+                if (href.startsWith('http://') || href.startsWith('https://')) {
+                    // 🔧 关键修复：直接代理外部资源，不拼接 targetHost
+                    return `${baseProxyUrl}?url=${href}`;
+                }
+
+                // 处理绝对路径（以 / 开头）
                 if (href.startsWith('/')) {
+                    // 🔧 修复：去掉多余的 /，直接拼接
                     return `${baseProxyUrl}?url=${targetHost}${href}`;
                 }
-                // 如果是完整 URL
-                if (href.startsWith('http://') || href.startsWith('https://')) {
-                    // 如果是同域名的完整 URL，转为代理
-                    const hrefParsed = new URL(href);
-                    if (hrefParsed.hostname === targetHost) {
-                        return `${baseProxyUrl}?url=${hrefParsed.hostname}${hrefParsed.pathname}${hrefParsed.search}`;
-                    }
-                    // 不同域名，保留原样或也代理（根据需求）
-                    return href;
-                }
-                // 如果是相对路径（不以 / 开头）
+
+                // 处理相对路径（不以 / 开头）
                 if (!href.startsWith('/') && !href.startsWith('http')) {
                     return `${baseProxyUrl}?url=${targetHost}/${href}`;
                 }
+
                 return href;
             };
 
-            // 重写 <a href>
-            responseBody = responseBody.replace(
-                /<a\s+([^>]*?)href=["']([^"']*)["']/gi,
-                (match, attrs, href) => {
-                    const newHref = proxyUrl(href);
-                    return `<a ${attrs}href="${newHref}"`;
-                }
-            );
+            // 重写所有资源链接
+            const rewriteTag = (html, tag, attr) => {
+                const regex = new RegExp(`<${tag}\\s+([^>]*?)${attr}=["']([^"']*)["']`, 'gi');
+                return html.replace(regex, (match, attrs, value) => {
+                    const newValue = proxyUrl(value);
+                    return `<${tag} ${attrs}${attr}="${newValue}"`;
+                });
+            };
 
-            // 重写 <link href> (CSS 等)
-            responseBody = responseBody.replace(
-                /<link\s+([^>]*?)href=["']([^"']*)["']/gi,
-                (match, attrs, href) => {
-                    const newHref = proxyUrl(href);
-                    return `<link ${attrs}href="${newHref}"`;
-                }
-            );
+            responseBody = rewriteTag(responseBody, 'a', 'href');
+            responseBody = rewriteTag(responseBody, 'link', 'href');
+            responseBody = rewriteTag(responseBody, 'script', 'src');
+            responseBody = rewriteTag(responseBody, 'img', 'src');
+            responseBody = rewriteTag(responseBody, 'form', 'action');
 
-            // 重写 <script src>
-            responseBody = responseBody.replace(
-                /<script\s+([^>]*?)src=["']([^"']*)["']/gi,
-                (match, attrs, src) => {
-                    const newSrc = proxyUrl(src);
-                    return `<script ${attrs}src="${newSrc}"`;
-                }
-            );
-
-            // 重写 <img src>
-            responseBody = responseBody.replace(
-                /<img\s+([^>]*?)src=["']([^"']*)["']/gi,
-                (match, attrs, src) => {
-                    const newSrc = proxyUrl(src);
-                    return `<img ${attrs}src="${newSrc}"`;
-                }
-            );
-
-            // 重写 CSS 中的 url()
+            // 重写 CSS url()
             responseBody = responseBody.replace(
                 /url\(["']?([^"')]*)["']?\)/gi,
                 (match, cssUrl) => {
@@ -131,38 +132,54 @@ export async function onRequest({ request, env }) {
                 }
             );
 
-            // 重写 <form action>
-            responseBody = responseBody.replace(
-                /<form\s+([^>]*?)action=["']([^"']*)["']/gi,
-                (match, attrs, action) => {
-                    const newAction = proxyUrl(action);
-                    return `<form ${attrs}action="${newAction}"`;
-                }
-            );
-
-            // 重写 <meta refresh> 和 <meta og:url>
+            // 重写 meta
             responseBody = responseBody.replace(
                 /<meta\s+([^>]*?)content=["']([^"']*)["']/gi,
                 (match, attrs, content) => {
-                    // 检查是否是 URL 类型的 meta
                     if (/url|URL|refresh|redirect/i.test(attrs)) {
-                        const newContent = proxyUrl(content);
-                        return `<meta ${attrs}content="${newContent}"`;
+                        return `<meta ${attrs}content="${proxyUrl(content)}"`;
                     }
                     return match;
                 }
             );
         }
 
-        // 7. 构造响应
+        // 7. CSS 内容重写（处理 CSS 中的 url()）
+        if (isCss) {
+            const baseProxyUrl = `${targetProtocol}//${url.host}${url.pathname}`;
+            const proxyUrl = (href) => {
+                if (!href) return href;
+                if (/^(javascript|mailto|tel|data|blob|ws|wss):/.test(href)) return href;
+                if (href.startsWith('http://') || href.startsWith('https://')) {
+                    return `${baseProxyUrl}?url=${href}`;
+                }
+                if (href.startsWith('/')) {
+                    return `${baseProxyUrl}?url=${targetHost}${href}`;
+                }
+                if (!href.startsWith('/') && !href.startsWith('http')) {
+                    return `${baseProxyUrl}?url=${targetHost}/${href}`;
+                }
+                return href;
+            };
+
+            responseBody = responseBody.replace(
+                /url\(["']?([^"')]*)["']?\)/gi,
+                (match, cssUrl) => {
+                    const newUrl = proxyUrl(cssUrl.trim());
+                    return `url("${newUrl}")`;
+                }
+            );
+        }
+
+        // 8. 构造响应
         const newResponse = new Response(responseBody, {
             status: response.status,
             statusText: response.statusText
         });
 
-        // 复制原响应头（除压缩相关）
+        // 复制原响应头
         for (const [key, value] of response.headers) {
-            if (!['content-encoding', 'content-length'].includes(key.toLowerCase())) {
+            if (!['content-encoding', 'content-length', 'content-security-policy'].includes(key.toLowerCase())) {
                 newResponse.headers.set(key, value);
             }
         }
@@ -172,9 +189,11 @@ export async function onRequest({ request, env }) {
         newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         newResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-        // 确保 HTML 内容类型正确
         if (isHtml) {
             newResponse.headers.set('Content-Type', 'text/html; charset=utf-8');
+        }
+        if (isCss) {
+            newResponse.headers.set('Content-Type', 'text/css; charset=utf-8');
         }
 
         return newResponse;
